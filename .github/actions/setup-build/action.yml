@@ -1,0 +1,128 @@
+name: 'Setup build environment'
+description: >
+  Install Zig and the Android NDK, check out Ghostty at a specific commit,
+  and export ANDROID_NDK_HOME / SOURCE_DATE_EPOCH for subsequent steps.
+  Shared by the stable and nightly workflows so toolchain versions are
+  pinned in a single place.
+
+inputs:
+  ghostty-commit:
+    description: 'Ghostty commit SHA to check out'
+    required: true
+  arch:
+    description: 'Android ABI (used to scope the per-arch build cache)'
+    required: true
+  ndk-version:
+    description: 'Android NDK version (e.g. r30)'
+    required: false
+    default: 'r30'
+
+runs:
+  using: composite
+  steps:
+    # --- Ghostty source (checked out first so we can read the Zig version) ---
+    - name: Checkout Ghostty
+      uses: actions/checkout@v7
+      with:
+        repository: ghostty-org/ghostty
+        ref: ${{ inputs.ghostty-commit }}
+        path: ghostty-src
+        fetch-depth: 1
+
+    - name: Determine Zig version from Ghostty source
+      id: zig-ver
+      shell: bash
+      run: |
+        set -euo pipefail
+        ver="$(grep -oP 'minimum_zig_version\s*=\s*"\K[^"]+' ghostty-src/build.zig.zon | head -1)"
+        [ -n "$ver" ] || { echo "Could not parse minimum_zig_version from build.zig.zon" >&2; exit 1; }
+        echo "version=$ver" >> "$GITHUB_OUTPUT"
+        echo "Ghostty requires Zig $ver"
+
+    # --- Zig (version from Ghostty's build.zig.zon) -------------------------
+    - name: Cache Zig toolchain
+      id: cache-zig
+      uses: actions/cache@v6
+      with:
+        path: ~/.local/zig
+        key: zig-${{ steps.zig-ver.outputs.version }}-x86_64-linux-v3
+
+    - name: Download Zig
+      if: steps.cache-zig.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        ver="${{ steps.zig-ver.outputs.version }}"
+        mkdir -p ~/.local/zig
+        url="https://ziglang.org/download/${ver}/zig-x86_64-linux-${ver}.tar.xz"
+        echo "Downloading Zig $ver from $url"
+        curl -fL "$url" | tar -xJ -C ~/.local/zig --strip-components=1
+
+    - name: Add Zig to PATH
+      shell: bash
+      run: |
+        if [ -x "$HOME/.local/zig/zig" ]; then
+          echo "$HOME/.local/zig" >> "$GITHUB_PATH"
+        elif [ -x "$HOME/.local/zig/bin/zig" ]; then
+          echo "$HOME/.local/zig/bin" >> "$GITHUB_PATH"
+        else
+          echo "zig binary not found after extraction" >&2
+          exit 1
+        fi
+
+    - name: Show Zig version
+      shell: bash
+      run: zig version
+
+    # --- Android NDK ----------------------------------------------------------
+    - name: Cache Android NDK
+      id: cache-ndk
+      uses: actions/cache@v6
+      with:
+        path: ~/.local/android-ndk
+        key: android-ndk-${{ inputs.ndk-version }}-x86_64-linux-v2
+
+    - name: Download Android NDK
+      if: steps.cache-ndk.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p ~/.local/android-ndk
+        url="https://dl.google.com/android/repository/android-ndk-${{ inputs.ndk-version }}-linux.zip"
+        echo "Downloading NDK from $url"
+        curl -fL "$url" -o /tmp/ndk.zip
+        unzip -q /tmp/ndk.zip -d ~/.local/android-ndk
+        rm -f /tmp/ndk.zip
+
+    - name: Export ANDROID_NDK_HOME
+      shell: bash
+      run: |
+        set -euo pipefail
+        ndk_dir="$(ls -d "$HOME/.local/android-ndk"/android-ndk-r* 2>/dev/null | head -1)"
+        [ -n "$ndk_dir" ] || { echo "NDK directory not found under ~/.local/android-ndk" >&2; exit 1; }
+        echo "ANDROID_NDK_HOME=$ndk_dir" >> "$GITHUB_ENV"
+        echo "Found NDK at $ndk_dir"
+
+    - name: Record Ghostty commit and SOURCE_DATE_EPOCH
+      id: ghostty
+      shell: bash
+      run: |
+        set -euo pipefail
+        commit="$(git -C ghostty-src rev-parse HEAD)"
+        ts="$(git -C ghostty-src log -1 --format=%ct)"
+        echo "GHOSTTY_COMMIT=$commit" >> "$GITHUB_ENV"
+        echo "SOURCE_DATE_EPOCH=$ts"  >> "$GITHUB_ENV"
+        echo "commit=$commit" >> "$GITHUB_OUTPUT"
+        echo "ts=$ts"          >> "$GITHUB_OUTPUT"
+        echo "Ghostty commit: $commit (timestamp: $ts)"
+
+    # --- Zig dependency + build cache (per-arch, per-commit) ------------------
+    - name: Cache Zig packages and build artifacts
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cache/zig
+          ghostty-src/.zig-cache
+        key: zig-build-${{ inputs.arch }}-${{ steps.ghostty.outputs.commit }}
+        restore-keys: |
+          zig-build-${{ inputs.arch }}-

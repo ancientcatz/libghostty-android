@@ -1,0 +1,219 @@
+# Nightly builder for libghostty-vt on Android.
+#
+# Builds libghostty-vt.so for arm64-v8a, armeabi-v7a, and x86_64 from the
+# Ghostty `tip` tag every day and publishes a GitHub **prerelease**
+# tagged `nightly-YYYYMMDD` (e.g. nightly-20261004).
+#
+# Triggers:
+#   - schedule           : daily at 00:17 UTC, builds ghostty-org/ghostty `tip`.
+#   - workflow_dispatch  : manual build of a specific tag or commit (defaults
+#                          to `tip`). Uses today's date as the tag.
+#
+# A prerelease is only created after ALL three architectures succeed.
+# Stable-release and nightly workflows are intentionally independent.
+#
+name: Nightly
+
+on:
+  schedule:
+    - cron: '17 0 * * *'
+  workflow_dispatch:
+    inputs:
+      ghostty_ref:
+        description: 'Ghostty ref to build (branch, tag, or commit; defaults to tip)'
+        required: true
+        default: 'tip'
+        type: string
+      force:
+        description: 'Delete and recreate today''s nightly if it already exists'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: read   # required for actions/cache
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  NDK_VERSION: 'r30'
+  ANDROID_API_LEVEL: '24'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.decide.outputs.should_build }}
+      ghostty_commit: ${{ steps.resolve.outputs.commit }}
+      ghostty_commit_short: ${{ steps.resolve.outputs.commit_short }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve Ghostty ref and nightly tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_REF: ${{ inputs.ghostty_ref }}
+        run: |
+          set -euo pipefail
+          ref="${INPUT_REF:-tip}"
+          [ -n "$ref" ] || ref="tip"
+          echo "Using Ghostty ref: $ref" >&2
+          ghostty_url="https://github.com/ghostty-org/ghostty.git"
+
+          # Resolve to a commit SHA. Prefer git ls-remote (no API, no rate
+          # limit) for branches and tags; fall back to the authenticated
+          # GitHub API for commit SHAs.
+          if printf '%s' "$ref" | grep -Eq '^[0-9a-f]{7,40}$'; then
+            commit="$(gh api "repos/ghostty-org/ghostty/commits/${ref}" -q .sha)"
+          else
+            # Try as a branch first, then as a tag. For annotated tags like
+            # `tip`, the peeled ref (refs/tags/<tag>^{}) points at the commit;
+            # prefer it over the tag object ref.
+            raw="$(git ls-remote "${ghostty_url}" "refs/heads/${ref}" "refs/tags/${ref}^{}" "refs/tags/${ref}")"
+            commit="$(printf '%s\n' "$raw" | grep '\^{}$' | awk '{print $1}' | head -1)"
+            if [ -z "$commit" ]; then
+              commit="$(printf '%s\n' "$raw" | awk '{print $1}' | head -1)"
+            fi
+            [ -n "$commit" ] || { echo "Could not resolve ref '$ref' on ghostty-org/ghostty" >&2; exit 1; }
+          fi
+          echo "Resolved commit: $commit" >&2
+
+          release_tag="nightly-$(date -u +%Y%m%d)"
+          echo "Nightly tag: $release_tag" >&2
+
+          echo "commit=$commit"           >> "$GITHUB_OUTPUT"
+          echo "commit_short=${commit:0:7}"   >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag"  >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to build
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.resolve.outputs.release_tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if gh release view "${RELEASE_TAG}" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            if [ "${FORCE}" = "true" ]; then
+              echo "Nightly ${RELEASE_TAG} already exists; force=true, deleting before rebuild." >&2
+              gh release delete "${RELEASE_TAG}" -R "${{ github.repository }}" --yes --cleanup-tag
+              echo "should_build=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Nightly ${RELEASE_TAG} already exists; skipping." >&2
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "Nightly ${RELEASE_TAG} does not exist yet; will build." >&2
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64-v8a, armeabi-v7a, x86_64]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup build environment
+        uses: ./.github/actions/setup-build
+        with:
+          ghostty-commit: ${{ needs.prepare.outputs.ghostty_commit }}
+          arch: ${{ matrix.arch }}
+          ndk-version: ${{ env.NDK_VERSION }}
+
+      - name: Build libghostty-vt
+        run: ./scripts/build.sh ${{ matrix.arch }}
+
+      - name: Smoke test (ABI / ELF)
+        run: ./scripts/smoke_test.sh ${{ matrix.arch }}
+
+      - name: Package
+        run: |
+          ./scripts/package.sh ${{ matrix.arch }} "${{ needs.prepare.outputs.ghostty_commit }}"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-${{ matrix.arch }}
+          path: staging/${{ matrix.arch }}/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: build-*
+          merge-multiple: true
+
+      - name: Build aggregated SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd artifacts
+          # The headers archive is arch-independent; pick one arch's copy
+          # and publish it as libghostty-vt-headers.tar.gz.
+          first_headers="$(ls include-ghostty-*.tar.gz 2>/dev/null | head -1)"
+          if [ -n "$first_headers" ]; then
+            mv "$first_headers" libghostty-vt-headers.tar.gz
+            rm -f include-ghostty-*.tar.gz
+          fi
+          sha256sum libghostty-vt-*.so libghostty-vt-*.tar.gz > SHA256SUMS
+          head -1 ghostty-commit-*.txt | tr -d '\n' > ghostty-commit.txt
+          rm -f ghostty-commit-*.txt
+          echo "Release assets:" >&2
+          ls -la >&2
+
+      - name: Create GitHub prerelease
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          name: ${{ needs.prepare.outputs.release_tag }}
+          prerelease: true
+          make_latest: false
+          body: |
+            # libghostty-vt for Android (nightly)
+
+            Built from the Ghostty `tip` tag at commit [`${{ needs.prepare.outputs.ghostty_commit_short }}`](https://github.com/ghostty-org/ghostty/tree/${{ needs.prepare.outputs.ghostty_commit }}).
+
+            - **Ghostty commit:** `${{ needs.prepare.outputs.ghostty_commit }}`
+            - **Android API level:** ${{ env.ANDROID_API_LEVEL }}
+            - **Android NDK:** ${{ env.NDK_VERSION }}
+            - **Zig:** determined from Ghostty's `build.zig.zon`
+            - **Architectures:** arm64-v8a, armeabi-v7a, x86_64
+
+            > This is an automated nightly prerelease. The Ghostty commit above is the exact `tip` HEAD at build time.
+
+            ## Assets
+
+            | File | Description |
+            |------|-------------|
+            | `libghostty-vt-<arch>.so` | Standalone shared library, ready to `dlopen`. |
+            | `libghostty-vt-<arch>.tar.gz` | Reproducible archive containing `libghostty-vt.so`. |
+            | `libghostty-vt-headers.tar.gz` | Reproducible archive of the C headers under `include/ghostty/`. |
+            | `SHA256SUMS` | SHA-256 checksums for every `.so` and `.tar.gz`. |
+            | `ghostty-commit.txt` | Exact upstream Ghostty commit used. |
+          files: |
+            artifacts/libghostty-vt-*.so
+            artifacts/libghostty-vt-*.tar.gz
+            artifacts/libghostty-vt-*.sha256
+            artifacts/SHA256SUMS
+            artifacts/ghostty-commit.txt
+          fail_on_unmatched_files: true
